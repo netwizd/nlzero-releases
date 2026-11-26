@@ -1,4 +1,4 @@
-# Установка nlzero 8.2.0
+# Установка nlzero 8.2.1
 
 Архив содержит установщик и подписанные пакеты ядра и агента. Он устанавливает
 управляющий сервер; ноды затем добавляются через Web-интерфейс.
@@ -28,15 +28,15 @@
 с обоими файлами сначала проверьте архив:
 
 ```bash
-sha256sum --check nlzero-8.2.0-linux-amd64.tar.gz.sha256
+sha256sum --check nlzero-8.2.1-linux-amd64.tar.gz.sha256
 ```
 
 Должен появиться результат `OK`; при несовпадении остановитесь. Только после
 успешной проверки распакуйте и проверьте комплект:
 
 ```bash
-tar -xzf nlzero-8.2.0-linux-amd64.tar.gz
-cd nlzero-8.2.0
+tar -xzf nlzero-8.2.1-linux-amd64.tar.gz
+cd nlzero-8.2.1
 ./install.sh verify
 ```
 
@@ -81,6 +81,97 @@ HTTPS и загрузит встроенные пакеты в каталог р
 Если установка остановилась после изменения сервера, сохраните сообщение
 об этапе и причину ошибки. Повторная установка поверх частичного состояния
 не поддерживается: сначала устраните причину и восстановите чистый сервер.
+
+## Обновление существующего ядра
+
+Заранее настройте зашифрованное резервное копирование и проверьте восстановление,
+как описано ниже. Обновление требует работающей конфигурации backup;
+пользователи, лицензии и настройки установленной системы сохраняются.
+Оставьте не менее 2 ГБ свободного места на диске с `/var/lib/nlzero` для
+временного комплекта и нового core, плюс место для резервной копии БД и настроек.
+
+Скачайте дистрибутив 8.2.1 и его `.sha256`, проверьте контрольную сумму и
+распакуйте архив, как описано выше. Из каталога `nlzero-8.2.1` запустите:
+
+```bash
+sudo ./install.sh update
+```
+
+Установщик проверяет подписи доверенными ключами уже установленного ядра.
+После завершения войдите в Web и проверьте версию в «Платформа → Параметры».
+Кнопка «Проверить GitHub» в параметрах и разделе «Релизы» показывает установленную
+и доступную версии, ссылки на страницу выпуска и дистрибутив.
+
+Новые пакеты ядра и агента добавьте в каталог через «Платформа → Релизы»:
+импортируйте соответствующие подписанные JSON-манифесты из выпуска GitHub,
+загрузите архив каждого компонента и дождитесь успешной проверки. Команда
+`update` не импортирует каталог автоматически. После этого обновляйте агенты
+штатным проверочным и поэтапным развёртыванием из Web.
+
+### Подготовка резервного копирования
+
+Если backup уже настроен, сохраните существующие ключи и получателей шифрования,
+затем проверьте свежую копию. Для первой настройки на **отдельной машине
+администратора**, где установлен `age`, создайте ключ восстановления:
+
+```bash
+umask 0077
+age-keygen -o recovery-identity.txt
+age-keygen -y recovery-identity.txt > age-recipients.txt
+```
+
+`recovery-identity.txt` — закрытый ключ: храните его вне ядра и отдельно от
+резервных копий. На ядро передайте только публичный `age-recipients.txt`.
+Из каталога с этим публичным файлом выполните на ядре:
+
+```bash
+sudo bash -eu <<'BACKUP_SETUP'
+umask 0077
+install -d -o root -g root -m 0700 /etc/nlzero/backup
+if [ ! -e /etc/nlzero/backup/age-recipients.txt ] && [ ! -L /etc/nlzero/backup/age-recipients.txt ]; then
+  install -o root -g root -m 0644 ./age-recipients.txt /etc/nlzero/backup/age-recipients.txt
+fi
+if [ ! -e /etc/nlzero/backup/signing-key ] && [ ! -L /etc/nlzero/backup/signing-key ]; then
+  ssh-keygen -q -t ed25519 -N '' -f /etc/nlzero/backup/signing-key
+  chmod 0600 /etc/nlzero/backup/signing-key
+fi
+if [ ! -e /etc/nlzero/backup/allowed-signers ] && [ ! -L /etc/nlzero/backup/allowed-signers ]; then
+  { printf 'nlzero-backup '; ssh-keygen -y -f /etc/nlzero/backup/signing-key; } \
+    > /etc/nlzero/backup/allowed-signers
+  chmod 0644 /etc/nlzero/backup/allowed-signers
+fi
+BACKUP_SETUP
+sudo systemctl enable --now nlzero-backup.timer nlzero-backup-freshness.timer
+sudo systemctl start nlzero-backup.service
+sudo systemctl start nlzero-backup-freshness.service
+sudo systemctl show nlzero-backup.service nlzero-backup-freshness.service \
+  --property=Id,Result,ExecMainStatus,ConditionResult
+```
+
+Для обеих служб нужны `Result=success`, `ExecMainStatus=0` и `ConditionResult=yes`.
+Таймеры включены до проверки: это сохраняет результат завершившихся служб
+в systemd и включает регулярные копии. При ошибке проверьте журнал
+`journalctl -u nlzero-backup.service -u nlzero-backup-freshness.service`.
+
+Сохраните вне сервера полный свежий каталог `/var/backups/nlzero/nlzero-*`
+с файлами `MANIFEST`, `MANIFEST.sig`, `nlzero-backup.tar.age` и отдельную копию
+`/etc/nlzero/backup/allowed-signers`. Не считайте локальную копию защитой от
+потери сервера. Для проверки восстановления используйте изолированный тестовый
+сервер с той же или совместимой версией nlzero; передайте на него выбранную
+копию, файл `allowed-signers` и временно — закрытый ключ восстановления с правами
+`root:root 0600`. Пример с заменяемыми абсолютными путями:
+
+```bash
+sudo /opt/nlzero/current/deploy/restore-drill.sh \
+  --backup-dir /absolute/offhost/nlzero-BACKUP_DIRECTORY \
+  --age-identity-file /root/recovery/recovery-identity.txt \
+  --allowed-signers-file /root/recovery/allowed-signers \
+  --database-name nlzero_restore_drill
+```
+
+После успешной проверки удалите временный закрытый ключ с тестового сервера;
+основной экземпляр остаётся у администратора. Этот сценарий проверяет обычный
+зашифрованный backup. Служебный checkpoint обновления имеет другой формат.
 
 ## Полное удаление
 
