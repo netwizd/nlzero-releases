@@ -81,7 +81,22 @@ def fetch(url, destination=None, limit=1 << 20, expected_size=None):
     deadline = time.monotonic() + (4 * 3600 if limit > (1 << 20) else 60)
     total = 0
     chunks = []
-    with opener.open(request, timeout=30) as response:
+    try:
+        response = opener.open(request, timeout=30)
+    except urllib.error.HTTPError as error:
+        status = error.code
+        limited = status == 429 or (status == 403 and (error.headers or {}).get("X-RateLimit-Remaining") == "0")
+        error.close()
+        if limited:
+            fail("GitHub ограничил число запросов. Подождите и повторите проверку позже.")
+        if status == 404:
+            if url == LATEST:
+                fail("В публичном репозитории GitHub пока нет доступного стабильного выпуска.")
+            fail("Файл выпуска GitHub недоступен. Проверьте страницу выпуска и повторите обновление позже.")
+        if 500 <= status <= 599:
+            fail("GitHub временно недоступен (HTTP " + str(status) + "). Повторите позже.")
+        fail("GitHub отклонил запрос (HTTP " + str(status) + "). Проверьте доступ к публичному репозиторию.")
+    with response:
         if response.status != 200:
             fail("GitHub вернул неожиданный HTTP-статус")
         length = response.headers.get("Content-Length")
@@ -309,19 +324,22 @@ def main(arguments=None):
     parser.add_argument("--check", action="store_true", help="только проверить выпуск; не скачивать архивы и не менять систему")
     args = parser.parse_args(arguments)
     if os.geteuid() != 0:
-        fail("Запустите sudo ./update.sh [--check]")
+        fail("Запустите sudo bash ./update.sh [--check]")
     os.umask(0o077)
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     current, verifier, trust = installed()
-    candidate, assets = latest_release(fetch(LATEST), current)
+    release_data = fetch(LATEST)
+    candidate, assets = latest_release(release_data, current)
     comparison = version(candidate) > version(current)
     print("Установлена " + current + "; GitHub latest stable: " + candidate + ".", flush=True)
     if not comparison:
         print("Более новой версии нет. Система не изменена.")
         return 0
+    release_page = document(release_data)["html_url"]
     if args.check:
-        print("Доступно обновление. Запустите sudo ./update.sh для установки.")
+        print("Доступно обновление. Запустите sudo bash ./update.sh для установки.")
+        print("Выпуск: " + release_page)
         return 0
     workspace = None
     try:
@@ -343,7 +361,7 @@ def main(arguments=None):
                 subprocess.run([str(installer), "update"], check=True, start_new_session=True)
             finally:
                 INSTALLING = False
-            print("Component-архивы и подписанные манифесты для каталога/нод: https://github.com/" + REPO + "/releases/tag/" + candidate, flush=True)
+            print("Component-архивы и подписанные манифесты для каталога/нод: " + release_page, flush=True)
             print("Импортируйте их в разделе «Релизы» и запустите preflight; временные загрузки будут удалены.", flush=True)
         return 0
     finally:
